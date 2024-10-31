@@ -1,82 +1,154 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
+/* ptrace */
 #include <sys/ptrace.h>
-#include <sys/types.h>
+/* wait */
 #include <sys/wait.h>
+/* pid_t */
+#include <sys/types.h>
+/* execve */
+#include <unistd.h>
+/* struct user_regs_struct */
 #include <sys/user.h>
-#include <syscall.h>
-#include <errno.h>
+/* printf */
+#include <stdio.h>
+/* syscalls_64 syscall_t */
+#include "syscalls.h"
 
-const char *syscall_names[] = {
-    "read", "write", "open", "close", "stat", "fstat", "lstat", "poll", "lseek",
-    "mmap", "mprotect", "munmap", "brk", "rt_sigaction", "rt_sigprocmask",
-    "rt_sigreturn", "ioctl", "pread64", "pwrite64", "readv", "writev", 
-    // Add more syscalls as needed
-};
 
-void print_hex(void *addr, size_t size) {
-    unsigned char *byte = (unsigned char *)addr;
-    for (size_t i = 0; i < size; i++) {
-        printf("%02x", byte[i]);
-        if (i < size - 1) {
-            printf(", ");
-        }
-    }
+/**
+ * printParams - prints registers containing syscall parameters as hex values
+ *   in ", " delimited series. Assumes 64-bit implementation.
+ *
+ * @regs: pointer to user_regs_struct containing latest registers queried
+ *   from tracee
+ * Return: 0 on success, 1 on failure
+ */
+void printParams(struct user_regs_struct *regs)
+{
+	size_t i;
+	unsigned long param;
+	syscall_t syscall = syscalls_64[regs->orig_rax];
+
+	if (!regs)
+		return;
+
+	for (i = 0; i < syscall.n_params; i++)
+	{
+		if (syscall.params[i] == VOID)
+			continue;
+		switch (i)
+		{
+		case 0:
+			param = (unsigned long)regs->rdi;
+			break;
+		case 1:
+			param = (unsigned long)regs->rsi;
+			break;
+		case 2:
+			param = (unsigned long)regs->rdx;
+			break;
+		case 3:
+			param = (unsigned long)regs->r10;
+			break;
+		case 4:
+			param = (unsigned long)regs->r8;
+			break;
+		case 5:
+			param = (unsigned long)regs->r9;
+			break;
+		default:
+			return;
+		}
+		if (syscall.params[i] == VARARGS)
+			printf("..."); /* never comma, always last parameter */
+		else
+			printf("%#lx%s", param,
+			       (i < syscall.n_params - 1) ? ", " : "");
+	}
 }
 
-void trace_process(pid_t child) {
-    struct user_regs_struct regs;
-    int status;
 
-    while (1) {
-        waitpid(child, &status, 0);
-        if (WIFEXITED(status)) {
-            break;
-        }
+/**
+ * tracerLoop - queries registers after successful execve in child, and at
+ *   every "syscall-enter-stop" to print syscall name and parameters, and at
+ *   every "syscall-exit-stop" to print return value. Assumes 64-bit
+ *   implementation.
+ *
+ * @child_pid: process ID of tracee/child
+ * Return: 0 on success, 1 on failure
+ */
+int tracerLoop(pid_t child_pid)
+{
+	int status, syscall_return, first_syscall;
+	struct user_regs_struct regs;
 
-        ptrace(PTRACE_GETREGS, child, NULL, &regs);
-        if (WIFSTOPPED(status) && (status >> 8) == SIGTRAP) {
-            // Get syscall number
-            long syscall_num = regs.orig_rax;
-            printf("%s(", syscall_names[syscall_num]);
+	first_syscall = 1; /* copied execve counts as first syscall of child */
+	syscall_return = 1; /* first wait is after execve return in child */
 
-            // Depending on the syscall, you might want to print different arguments
-            // For now, we will print only the first argument as an example
-            printf("0x%llx", regs.rdi); // First argument in rdi
-            printf(", 0x%llx", regs.rsi); // Second argument in rsi
-            printf(", ..."); // Indicate more arguments are present
-            printf(")\n");
+	while (1)
+	{
+		if (wait(&status) == -1)
+			return (1);
+		if (WIFEXITED(status))
+		{
+			printf(") = ?\n");
+			break;
+		}
 
-            // Execute the syscall
-            ptrace(PTRACE_SYSCALL, child, NULL, NULL);
-            waitpid(child, &status, 0);
-            ptrace(PTRACE_GETREGS, child, NULL, &regs);
+		if (ptrace(PTRACE_GETREGS, child_pid, NULL, &regs) == -1)
+			return (1);
 
-            // Get return value
-            long ret_val = regs.rax;
-            printf(" = 0x%llx\n", ret_val);
-        }
-    }
+		if (!syscall_return || first_syscall)
+		{
+			printf("%s(", syscalls_64[regs.orig_rax].name);
+			printParams(&regs);
+			fflush(stdout);
+			first_syscall = 0;
+		}
+
+		if (syscall_return)
+			printf(") = %#lx\n", (unsigned long)regs.rax);
+
+		if (ptrace(PTRACE_SYSCALL, child_pid, NULL, NULL) == -1)
+			return (1);
+
+		/* wait will return after every syscall entry and return */
+		syscall_return = syscall_return ? 0 : 1;
+	}
+
+	return (0);
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s command [args...]\n", argv[0]);
-        return 1;
-    }
 
-    pid_t child = fork();
-    if (child == 0) {
-        // Child process: allow tracing and exec the command
-        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
-        execvp(argv[1], &argv[1]);
-        perror("execvp failed");
-        return 1;
-    } else {
-        // Parent process: trace the child
-        trace_process(child);
-    }
+/**
+ * main - entry point for strace_3
+ *
+ * @argc: count of command line parameters
+ * @argv: array of command line parameters
+ * @envp: array of environmental variables
+ * Return: 0 on success, 1 on failure
+ */
+int main(int argc, char *argv[], char *envp[])
+{
+	pid_t pid;
 
-    return 0;
+	if (argc < 2 || !argv)
+	{
+		fprintf(stderr, "usage: %s <prog> <prog args>...\n", argv[0]);
+		return (1);
+	}
+
+	switch (pid = fork())
+	{
+	case -1:
+		return (1);
+	case 0: /* child/tracee */
+		if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1)
+			return (1);
+		if (execve(argv[1], argv + 1, envp) == -1)
+			return (1);
+	default:
+		break;
+	}
+
+	return (tracerLoop(pid));
 }
