@@ -1,154 +1,140 @@
-/* ptrace */
-#include <sys/ptrace.h>
-/* wait */
-#include <sys/wait.h>
-/* pid_t */
-#include <sys/types.h>
-/* execve */
-#include <unistd.h>
-/* struct user_regs_struct */
-#include <sys/user.h>
-/* printf */
-#include <stdio.h>
-/* syscalls_64 syscall_t */
-#include "syscalls.h"
+#include "strace.h"
 
+void trace_child(char **av, char **envp);
+void trace_parent(pid_t child_pid);
+int await_syscall(pid_t child_pid);
+unsigned long get_syscall_param(struct user_regs_struct uregs, size_t i);
 
 /**
- * printParams - prints registers containing syscall parameters as hex values
- *   in ", " delimited series. Assumes 64-bit implementation.
- *
- * @regs: pointer to user_regs_struct containing latest registers queried
- *   from tracee
- * Return: 0 on success, 1 on failure
+ * main - entry point
+ * @ac: argument count
+ * @av: argument vector
+ * @envp: environ
+ * Return: EXIT_SUCCESS or error.
  */
-void printParams(struct user_regs_struct *regs)
+int main(int ac, char **av, char **envp)
 {
-	size_t i;
-	unsigned long param;
-	syscall_t syscall = syscalls_64[regs->orig_rax];
+	pid_t child_pid;
 
-	if (!regs)
-		return;
-
-	for (i = 0; i < syscall.n_params; i++)
+	if (ac < 2)
 	{
-		if (syscall.params[i] == VOID)
-			continue;
-		switch (i)
-		{
-		case 0:
-			param = (unsigned long)regs->rdi;
-			break;
-		case 1:
-			param = (unsigned long)regs->rsi;
-			break;
-		case 2:
-			param = (unsigned long)regs->rdx;
-			break;
-		case 3:
-			param = (unsigned long)regs->r10;
-			break;
-		case 4:
-			param = (unsigned long)regs->r8;
-			break;
-		case 5:
-			param = (unsigned long)regs->r9;
-			break;
-		default:
-			return;
-		}
-		if (syscall.params[i] == VARARGS)
-			printf("..."); /* never comma, always last parameter */
-		else
-			printf("%#lx%s", param,
-			       (i < syscall.n_params - 1) ? ", " : "");
+		printf("Usage: %s command [args...]\n", av[0]);
+		return (EXIT_FAILURE);
 	}
-}
-
-
-/**
- * tracerLoop - queries registers after successful execve in child, and at
- *   every "syscall-enter-stop" to print syscall name and parameters, and at
- *   every "syscall-exit-stop" to print return value. Assumes 64-bit
- *   implementation.
- *
- * @child_pid: process ID of tracee/child
- * Return: 0 on success, 1 on failure
- */
-int tracerLoop(pid_t child_pid)
-{
-	int status, syscall_return, first_syscall;
-	struct user_regs_struct regs;
-
-	first_syscall = 1; /* copied execve counts as first syscall of child */
-	syscall_return = 1; /* first wait is after execve return in child */
-
-	while (1)
+	setbuf(stdout, NULL);
+	child_pid = fork();
+	if (child_pid == -1)
 	{
-		if (wait(&status) == -1)
-			return (1);
-		if (WIFEXITED(status))
-		{
-			printf(") = ?\n");
-			break;
-		}
-
-		if (ptrace(PTRACE_GETREGS, child_pid, NULL, &regs) == -1)
-			return (1);
-
-		if (!syscall_return || first_syscall)
-		{
-			printf("%s(", syscalls_64[regs.orig_rax].name);
-			printParams(&regs);
-			fflush(stdout);
-			first_syscall = 0;
-		}
-
-		if (syscall_return)
-			printf(") = %#lx\n", (unsigned long)regs.rax);
-
-		if (ptrace(PTRACE_SYSCALL, child_pid, NULL, NULL) == -1)
-			return (1);
-
-		/* wait will return after every syscall entry and return */
-		syscall_return = syscall_return ? 0 : 1;
+		dprintf(STDERR_FILENO, "Fork failed: %d\n", errno);
+		exit(-1);
 	}
-
+	else if (!child_pid)
+		trace_child(av, envp);
+	else
+		trace_parent(child_pid);
 	return (0);
 }
 
+/**
+ * trace_child - traces child process
+ * @av: argument vector for execve
+ * @envp: environ for execve
+ */
+void trace_child(char **av, char **envp)
+{
+	setbuf(stdout, NULL);
+	printf("execve(0, 0, 0) = 0\n");
+	ptrace(PTRACE_TRACEME, 0, 0, 0);
+	kill(getpid(), SIGSTOP);
+	if (execve(av[1], av + 1, envp) == -1)
+	{
+		dprintf(STDERR_FILENO, "Exec failed: %d\n", errno);
+		exit(-1);
+	}
+}
 
 /**
- * main - entry point for strace_3
- *
- * @argc: count of command line parameters
- * @argv: array of command line parameters
- * @envp: array of environmental variables
- * Return: 0 on success, 1 on failure
+ * trace_parent - calls made by tracing parent
+ * @child_pid: pid of child to trace
  */
-int main(int argc, char *argv[], char *envp[])
+void trace_parent(pid_t child_pid)
 {
-	pid_t pid;
+	int status, i, first = 1;
+	struct user_regs_struct uregs;
 
-	if (argc < 2 || !argv)
+	waitpid(child_pid, &status, 0);
+	ptrace(PTRACE_SETOPTIONS, child_pid, 0, PTRACE_O_TRACESYSGOOD);
+	while (1)
 	{
-		fprintf(stderr, "usage: %s <prog> <prog args>...\n", argv[0]);
-		return (1);
+		if (await_syscall(child_pid))
+			break;
+		memset(&uregs, 0, sizeof(uregs));
+		ptrace(PTRACE_GETREGS, child_pid, 0, &uregs);
+		if (first && uregs.orig_rax == 59)
+			first = 1;
+		else
+		{
+			printf("%s(", syscalls_64_g[uregs.orig_rax].name);
+			for (i = 0; i < (int)syscalls_64_g[uregs.orig_rax].nb_params; i++)
+			{
+				if (i)
+					printf(", ");
+				if (syscalls_64_g[uregs.orig_rax].params[i] == VARARGS)
+					printf("...");
+				else
+					printf("%#lx", get_syscall_param(uregs, i));
+			}
+		}
+		if (await_syscall(child_pid))
+			break;
+		memset(&uregs, 0, sizeof(uregs));
+		ptrace(PTRACE_GETREGS, child_pid, 0, &uregs);
+		if (first && uregs.orig_rax == 59)
+			first = 0;
+		else
+			printf(") = %#lx\n", (unsigned long)uregs.rax);
 	}
+}
 
-	switch (pid = fork())
+/**
+ * await_syscall - waits for a syscall
+ * @child_pid: pid of process to await
+ * Return: 0 if child stopped, 1 if exited
+ */
+int await_syscall(pid_t child_pid)
+{
+	int status;
+
+	while (1)
 	{
-	case -1:
-		return (1);
-	case 0: /* child/tracee */
-		if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1)
+		ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
+		waitpid(child_pid, &status, 0);
+		if (WIFSTOPPED(status) && WSTOPSIG(status) & 0x80)
+			return (0);
+		if (WIFEXITED(status))
+		{
+			printf(") = ?\n");
 			return (1);
-		if (execve(argv[1], argv + 1, envp) == -1)
-			return (1);
-	default:
-		break;
+		}
 	}
+}
 
-	return (tracerLoop(pid));
+/**
+ * get_syscall_param - gets given parameter for syscall
+ * @uregs: userspace register struct
+ * @i: syscall parameter index
+ * Return: value of param
+ */
+unsigned long get_syscall_param(struct user_regs_struct uregs, size_t i)
+{
+	switch (i)
+	{
+		case 0: return (uregs.rdi);
+		case 1: return (uregs.rsi);
+		case 2: return (uregs.rdx);
+		case 3: return (uregs.r10);
+		case 4: return (uregs.r8);
+		case 5: return (uregs.r9);
+		default: return (-1);
+	}
 }
